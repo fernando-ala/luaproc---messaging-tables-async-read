@@ -75,6 +75,9 @@ static int luaproc_get_numworkers( lua_State *L );
 static int luaproc_recycle_set( lua_State *L );
 /*new prototypes*/
 static int myread_test (lua_State *L);
+static int mywrite_test (lua_State *L);
+static int myread_continuation (lua_State *L);
+static int mywrite_continuation (lua_State *L);
 static void pushLuaTable( lua_State *Lfrom, lua_State *Lto );
 /*end new*/
 
@@ -90,7 +93,6 @@ struct stluaproc {
   channel *chan;
   luaproc *next;
   /*new*/
-  int hasRequestedIO;
   struct aiocb *ctrlBlck;
   /*end new*/  
 };
@@ -116,6 +118,7 @@ static const struct luaL_Reg luaproc_funcs[] = {
   { "recycle", luaproc_recycle_set },
   /*new*/
   { "myRead", myread_test},
+  { "myWrite", mywrite_test},
   /*end new*/
   { NULL, NULL }
 };
@@ -550,7 +553,6 @@ static luaproc *luaproc_new( lua_State *L ) {
   lua_setglobal( lpst, "luaproc" );
   lp->lstate = lpst;  /* insert created lua state into lua process struct */
   /*new*/
-  lp->hasRequestedIO = 0;
   lp->ctrlBlck = NULL;
   /*end new*/
   return lp;
@@ -662,7 +664,7 @@ static int luaproc_create_newproc( lua_State *L ) {
 }
 
 /*new*/
-/*Test for non-blocking reading*/
+/* Test for non-blocking reading */
 static int myread_test (lua_State *L)
 {
 	const char *fileName;
@@ -680,82 +682,177 @@ static int myread_test (lua_State *L)
 	
 	self = luaproc_getself( L );
 	if ( self != NULL )
-	{	
-		/*Test if the request has already been made*/
-		if(self->hasRequestedIO == 0)//First time
-		{	
-			// open the file
-			file = open(fileName, O_RDONLY);
-			/*Test if file was found*/
-			if (file == -1)
-			{
-				lua_pushboolean( L, FALSE );//Still Reading = false
-				lua_pushfstring( L, "File '%s' was not found", fileName );
-				free(buffer);
-				return 2;
-			}			
-			// create the control block structure
-			memset(ctrlBlck, 0, sizeof(struct aiocb));//Set everything as 0
-			ctrlBlck->aio_nbytes = sizeOfBuffer; //Length of transfer = Size to Read (size of buffer)?
-			ctrlBlck->aio_fildes = file;    //File descriptor
-			ctrlBlck->aio_offset = 0;	   //File offset
-			ctrlBlck->aio_buf = buffer;	   //Location of Buffer
-			/*
-			ctrlBlck.aio_reqprio = 0;   // Request priority
-            ctrlBlck.aio_sigevent = NULL;  // Notification method...test if NULL works later
-            ctrlBlck.aio_lio_opcode = 0;// Operation to be performed;lio_listio() only
-			*/
-						
-			/*Test if IO request was successful*/
-			if (aio_read(ctrlBlck) == -1)
-			{
-				lua_pushboolean( L, FALSE );//Still Reading = false
-				lua_pushstring( L, "Unable to create async read request" );		
-				free(buffer);
-				close(file);
-				return 2;
-			}
-			/*Mark file request*/
-			self->hasRequestedIO = 1;
-			self->ctrlBlck = ctrlBlck; //save control block in lua process
-		}
-		/*Test if IO is in progress*/
-		if(aio_error(self->ctrlBlck) == EINPROGRESS)
+	{				
+		// open the file
+		file = open(fileName, O_RDONLY);
+		/*Test if file was found*/
+		if (file == -1)
 		{
-			lua_pushboolean( L, TRUE );//Still Reading = true
-			lua_pushfstring( L, "still reading file '%s'...\n", fileName );
-			/* yield */
-			self->args = 2; // Number of arguments for lua_resume ('lpsched.c' doesnt use the number from 'lua_yield') 
-			self->status = LUAPROC_STATUS_BLOCKED_AIO;
-			return lua_yieldk( L, 0, 0, &myread_test);			
+			lua_pushboolean( L, FALSE );//Still Reading = false
+			lua_pushfstring( L, "File '%s' was not found", fileName );
+			free(buffer);
+			return 2;
+		}			
+		// create the control block structure
+		memset(ctrlBlck, 0, sizeof(struct aiocb));//Set everything as 0
+		ctrlBlck->aio_nbytes = sizeOfBuffer; //Length of transfer = Size to Read (size of buffer)?
+		ctrlBlck->aio_fildes = file;    //File descriptor
+		ctrlBlck->aio_offset = 0;	   //File offset
+		ctrlBlck->aio_buf = buffer;	   //Location of Buffer
+		/*
+		ctrlBlck.aio_reqprio = 0;   // Request priority
+		ctrlBlck.aio_sigevent = NULL;  // Notification method...test if NULL works later
+		ctrlBlck.aio_lio_opcode = 0;// Operation to be performed;lio_listio() only
+		*/
+					
+		/*Test if IO request was successful*/
+		if (aio_read(ctrlBlck) == -1)
+		{
+			lua_pushboolean( L, FALSE );//Still Reading = false
+			lua_pushstring( L, "Unable to create async read request" );		
+			free(buffer);
+			close(file);
+			return 2;
+		}		
+		self->ctrlBlck = ctrlBlck; //save control block in lua process
+	
+		return myread_continuation( L );
+	}
+	return 0;
+}
+
+/* continuation function for yielding when I/O not finished */
+static int myread_continuation (lua_State *L)
+{
+	int numBytesRead;
+	luaproc *self;
+	self = luaproc_getself( L );
+	
+	/*Test if IO is in progress*/
+	if(aio_error(self->ctrlBlck) == EINPROGRESS)
+	{
+		lua_pushboolean( L, TRUE );//Still Reading = true
+		lua_pushfstring( L, "still reading file...\n" );
+		/* yield */
+		self->args = 2; // Number of arguments for lua_resume ('lpsched.c' doesnt use the number from 'lua_yield') 
+		self->status = LUAPROC_STATUS_BLOCKED_AIO;
+		return lua_yieldk( L, 0, 0, &myread_continuation);			
+	}
+	else//IO complete
+	{	
+		/* Test if successful */
+		numBytesRead = aio_return(self->ctrlBlck);
+		self->args = 0; //reseting the args, since it was removed from 'lpsched.c'...might not be necessary
+						//(check the impact of removing this argument reset from 'lpsched.c')
+		
+		if (numBytesRead != -1)
+		{
+			lua_pushboolean( L, FALSE );//Still Reading = false
+			lua_pushfstring( L, "File read complete:\n '%s'\nEND FILE\n", self->ctrlBlck->aio_buf );
+			free(self->ctrlBlck->aio_buf);
+			close(self->ctrlBlck->aio_fildes);
+			free(self->ctrlBlck);
+			return 2;
 		}
-		else//IO complete
-		{	
-			/* Test if successful */
-			numBytesRead = aio_return(self->ctrlBlck);
-			self->hasRequestedIO = 0;//Unmark file request
-			self->args = 0; //reseting the args, since it was removed from 'lpsched.c'...might not be necessary
-							//(check the impact of removing this argument reset from 'lpsched.c')
-			
-			if (numBytesRead != -1)
-			{
-				lua_pushboolean( L, FALSE );//Still Reading = false
-				lua_pushfstring( L, "File read complete:\n '%s'\nEND FILE\n", self->ctrlBlck->aio_buf );
-				free(self->ctrlBlck->aio_buf);
-				close(self->ctrlBlck->aio_fildes);
-				free(self->ctrlBlck);
-				return 2;
-			}
-			else
-			{
-				lua_pushboolean( L, FALSE );//Still Reading = false
-				lua_pushfstring( L, "Error! File read unsuccessful\n" );		
-				free(self->ctrlBlck->aio_buf);
-				close(self->ctrlBlck->aio_fildes);
-				free(self->ctrlBlck);
-				return 2;
-			}
+		else
+		{
+			lua_pushboolean( L, FALSE );//Still Reading = false
+			lua_pushfstring( L, "Error! File read unsuccessful\n" );		
+			free(self->ctrlBlck->aio_buf);
+			close(self->ctrlBlck->aio_fildes);
+			free(self->ctrlBlck);
+			return 2;
 		}
+	}
+}
+
+/* Test for non-blocking writing */
+static int mywrite_test (lua_State *L)
+{	
+	const char *fileName;
+	const char *fileContentToWrite;//TODO: ver se esse campo vai ser necessariamente string (ou seja, a função só receber string)
+	size_t len;
+	int file;
+	luaproc *self;
+	// Async IO control block structure
+	struct aiocb *ctrlBlck = (struct aiocb *)malloc(sizeof(struct aiocb));	
+		
+	fileName = lua_tolstring( L, 1, &len );//Arquive name in Lua Stack
+	fileContentToWrite = lua_tolstring( L, 2, &len );//Arquive content to Write in Lua Stack
+	
+	//printf("fileName: %s\n", fileName);
+	//printf("fileContentToWrite: %s\n", fileContentToWrite);
+	//printf("size: %d\n", strlen(fileContentToWrite));
+	
+	self = luaproc_getself( L );
+	if ( self != NULL )
+	{		
+		// open the file
+		file = open(fileName, O_CREAT | O_WRONLY, S_IRWXO);
+		/*Test if file was found/created*/
+		if (file == -1)
+		{
+			lua_pushboolean( L, FALSE );//Still Writing = false
+			lua_pushfstring( L, "File '%s' was not found", fileName );
+			//free(fileContentToWrite);
+			return 2;
+		}			
+		// create the control block structure
+		memset(ctrlBlck, 0, sizeof(struct aiocb));			//Set everything as 0
+		ctrlBlck->aio_nbytes = strlen(fileContentToWrite); 	//Length of transfer = Size to Read (size of buffer)?
+		ctrlBlck->aio_fildes = file;    					//File descriptor
+		ctrlBlck->aio_offset = 0;	   						//File offset
+		ctrlBlck->aio_buf = fileContentToWrite;	   			//Location of Buffer
+		/*
+		ctrlBlck.aio_reqprio = 0;   // Request priority
+		ctrlBlck.aio_sigevent = NULL;  // Notification method...test if NULL works later
+		ctrlBlck.aio_lio_opcode = 0;// Operation to be performed;lio_listio() only
+		*/
+					
+		/*Test if IO request was successful*/
+		if (aio_write(ctrlBlck) == -1)
+		{
+			lua_pushboolean( L, FALSE );//Still Writing = false
+			lua_pushstring( L, "Unable to create async write request" );		
+			//free(fileContentToWrite);
+			close(file);
+			return 2;
+		}			
+		self->ctrlBlck = ctrlBlck; //save control block in lua process
+	
+		return mywrite_continuation( L );
+	}
+	return 0;
+}
+
+/* continuation function for yielding when I/O not finished */
+static int mywrite_continuation (lua_State *L)
+{
+	luaproc *self;
+	self = luaproc_getself( L );
+	/*Test if IO is in progress*/
+	if(aio_error(self->ctrlBlck) == EINPROGRESS)
+	{
+		lua_pushboolean( L, TRUE );//Still Writing = true
+		lua_pushfstring( L, "still writing file...\n");
+		/* yield */
+		self->args = 2; // Number of arguments for lua_resume ('lpsched.c' doesnt use the number from 'lua_yield') 
+		self->status = LUAPROC_STATUS_BLOCKED_AIO;
+		return lua_yieldk( L, 0, 0, &mywrite_continuation);			
+	}
+	else//IO complete
+	{	
+		/* Test if successful */
+		//numBytesRead = aio_return(self->ctrlBlck);		
+		self->args = 0; //reseting the args, since it was removed from 'lpsched.c'...might not be necessary
+						//(check the impact of removing this argument reset from 'lpsched.c')
+		
+		lua_pushboolean( L, FALSE );//Still Writing = false
+		lua_pushfstring( L, "File write complete:\n '%s'\nEND FILE\n", self->ctrlBlck->aio_buf );
+		//free(self->ctrlBlck->aio_buf);
+		close(self->ctrlBlck->aio_fildes);
+		free(self->ctrlBlck);
+		return 2;		
 	}
 }
 /*end new*/
