@@ -15,6 +15,9 @@
 #define LUAPROC_STATUS_BLOCKED_SEND   2
 #define LUAPROC_STATUS_BLOCKED_RECV   3
 #define LUAPROC_STATUS_FINISHED       4
+/*new*/
+#define LUAPROC_STATUS_BLOCKED_AIO    5
+/*end new*/
 
 /*******************
  * structure types *
@@ -46,6 +49,14 @@ void luaproc_queue_sender( luaproc *lp );
 
 /* queue a lua process that tried to receive a message */
 void luaproc_queue_receiver( luaproc *lp );
+
+/*new*/
+/* queue a lua process that is waiting for an AIO result */
+void luaproc_queue_aio( list *blocked_aio_list, luaproc *lp );
+
+/* return the AIO control block (aio.h) of the lua process*/
+struct aiocb* luaproc_get_aio_ctrlblock( luaproc *lp );
+/*end new*/
 
 /* add a lua process to the recycle list */
 void luaproc_recycle_insert( luaproc *lp );
@@ -81,7 +92,7 @@ int list_count( list *l );
 
 
 /******************************************************************************
-* Copyright 2008-2013 Alexandre Skyrme, Noemi Rodriguez, Roberto Ierusalimschy
+* Copyright 2008-2015 Alexandre Skyrme, Noemi Rodriguez, Roberto Ierusalimschy
 *
 * Permission is hereby granted, free of charge, to any person obtaining
 * a copy of this software and associated documentation files (the
