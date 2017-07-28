@@ -13,13 +13,38 @@
 #include "lpsched.h"
 #include "luaproc.h"
 
+/*new*/
+//#include <unistd.h> /* usleep */
+#include <semaphore.h>
+#include <aio.h> /* aio_read, aio_error, aio_return */
+#include <errno.h> /* EINPROGRESS */
+/*end new*/
+
 #define FALSE 0
 #define TRUE  !FALSE
 #define LUAPROC_SCHED_WORKERS_TABLE "workertb"
 
+#if (LUA_VERSION_NUM >= 502)
+#define luaproc_resume( L, from, nargs ) lua_resume( L, from, nargs )
+#else
+#define luaproc_resume( L, from, nargs ) lua_resume( L, nargs )
+#endif
+
 /********************
  * global variables *
  *******************/
+
+/*new*/
+/* thread that checks the AIO list for finished AIO */
+pthread_t aio_worker;
+
+pthread_mutex_t mutex_aio_list = PTHREAD_MUTEX_INITIALIZER;
+
+sem_t aio_req_sem;
+
+/* list of blocked AIO lua processes */
+list blocked_lp_aio_list;
+/*end new*/
 
 /* ready process list */
 list ready_lp_list;
@@ -52,12 +77,6 @@ static void sched_dec_lpcount( void );
 /*******************************
  * worker thread main function *
  *******************************/
-
-#if LUA_VERSION_NUM >= 502
-#define luaproc_resume( L, from, nargs ) lua_resume( L, from, nargs )
-#else
-#define luaproc_resume( L, from, nargs ) lua_resume( L, nargs )
-#endif
 
 /* worker thread main function */
 void *workermain( void *args ) {
@@ -126,6 +145,17 @@ void *workermain( void *args ) {
         /* unlock channel */
         luaproc_unlock_channel( luaproc_get_channel( lp ));
       }
+	  
+	  /*new*/
+	  /* yield due to assyncronous I/O */
+      else if ( luaproc_get_status( lp ) == LUAPROC_STATUS_BLOCKED_AIO ) {        
+		pthread_mutex_lock( &mutex_aio_list );
+		luaproc_queue_aio( &blocked_lp_aio_list, lp );  /* queue lua process on blocked aio list */
+		pthread_mutex_unlock( &mutex_aio_list );
+
+		sem_post(&aio_req_sem);//up semaphore (added aio req...aio_thread can work now)		
+      }
+	  /*end new*/
 
       /* yield on explicit coroutine.yield call */
       else { 
@@ -146,6 +176,47 @@ void *workermain( void *args ) {
     }
   }    
 }
+
+/*new*/
+/* aio list thread main function */
+void *aioworkermain( void *args ) {
+  luaproc *lp;
+  
+  pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS,NULL);
+
+  while ( TRUE ) {    /* search list for finished AIO */
+  
+	sem_wait(&aio_req_sem);//down semaphore (received req)
+
+	pthread_mutex_lock( &mutex_aio_list );
+	lp = list_remove( &blocked_lp_aio_list );//returns head or NULL if empty
+	pthread_mutex_unlock( &mutex_aio_list );
+	
+	if (lp != NULL)
+	{
+	  struct aiocb* ctrlblock = (struct aiocb*)luaproc_get_aio_ctrlblock( lp );
+	  /*Test if AIO is in progress*/
+	  if(aio_error(ctrlblock) == EINPROGRESS)
+	  {
+	    /*returns to end of blocked AIO list*/
+		pthread_mutex_lock( &mutex_aio_list );
+		luaproc_queue_aio( &blocked_lp_aio_list, lp );
+		pthread_mutex_unlock( &mutex_aio_list );
+
+		sem_post(&aio_req_sem);//up semaphore (req not finished)
+	  }
+	  else
+	  {
+	    /*AIO finished*/
+		sched_queue_proc( lp );/* schedule lua process for execution */	    
+		if( list_count( &ready_lp_list ) == 0 )
+			pthread_cond_signal( &cond_wakeup_worker ); 
+	  }
+	}
+	
+  }  
+}
+/*end new*/
 
 /***********************
  * auxiliary functions *
@@ -206,6 +277,18 @@ int sched_init( void ) {
     workerscount++; /* increase active workers count */
   }
 
+  /*new*/  
+  /* initialize blocked aio process list */
+  list_init( &blocked_lp_aio_list );
+  /* initialize as zero, to block aio_thread from acessing empty list */  
+  sem_init(&aio_req_sem, 0, 0);
+
+  if ( pthread_create( &aio_worker, NULL, aioworkermain, NULL ) != 0 ) {
+      lua_pop( workerls, 1 ); /* pop workers table from stack */
+      return LUAPROC_SCHED_PTHREAD_ERROR;
+    }
+  /*end new*/
+  
   lua_pop( workerls, 1 ); /* pop workers table from stack */
 
   return LUAPROC_SCHED_OK;
@@ -330,6 +413,12 @@ void sched_join_workers( void ) {
   lua_pop( L, 1 );
 
   lua_close( workerls );
+
+/*new*/
+  pthread_cancel( aio_worker );
+  pthread_join(aio_worker, NULL );
+/*end new*/  
+
   lua_close( L );
 }
 
